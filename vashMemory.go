@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -25,13 +26,9 @@ var (
 	writeProcessMemory     = kernel32.NewProc("WriteProcessMemory")
 	openProcess            = kernel32.NewProc("OpenProcess")
 	closeHandle            = kernel32.NewProc("CloseHandle")
-	err                    error
-	pid                    uint32
+	isWow64ProcessProc     = kernel32.NewProc("IsWow64Process")
 	aobCache               []AobCache
-	convertedAob           []string
-	addrLocation           int64
-	memRead                uint64
-	relativeLocation       uintptr
+	aobMu                  sync.Mutex
 )
 
 const (
@@ -44,22 +41,8 @@ const (
 	PROCESS_VM_OPERATION              = 0x0008
 	PROCESS_QUERY_INFO                = 0x0400
 	GWL_HINSTANCE                     = int32(-6)
-	TH32CS_SNAPMODULE                 = 0x00000008
-	TH32CS_SNAPMODULE32               = 0x00000010
+	maxStringRead                     = 4096
 )
-
-type ModuleEntry32 struct {
-	dwSize        uint32
-	th32ModuleID  uint32
-	th32ProcessID uint32
-	GlblcntUsage  uint32
-	ProccntUsage  uint32
-	modBaseAddr   uintptr
-	modBaseSize   uint32
-	hModule       syscall.Handle
-	szModule      [256]uint16
-	szExePath     [260]uint16
-}
 
 type AobCache struct {
 	aobPattern string
@@ -86,20 +69,22 @@ func GetPointerDynamic(pHandle, base *uintptr, aobScan *string, offset int64, pi
 	if size == 0 {
 		size = 4
 	}
-
-	if convertedAob, err = HexStringToPattern(*aobScan); err != nil {
-		fmt.Println("could not convert aobScan to converted AOB", aobScan, convertedAob)
+	pattern, err := HexStringToPattern(*aobScan)
+	if err != nil {
+		fmt.Println("could not convert aobScan to converted AOB", aobScan, err)
+		return 0
 	}
-
-	addrLocation = ProcessPatternScan(pHandle, 0, 0, convertedAob...) + offset
-
-	if memRead, err = ReadMemory(uintptr(addrLocation), int(*pid), size); err != nil {
+	found := ProcessPatternScan(pHandle, 0, 0, pattern...)
+	if found <= 0 {
+		fmt.Println("address location of pattern scan invalid")
+		return 0
+	}
+	memRead, err := ReadMemory(uintptr(found+offset), int(*pid), size)
+	if err != nil {
 		fmt.Println("address location of pattern scan invalid: ", err)
+		return 0
 	}
-	relativeLocation = uintptr(memRead) - *base
-
-	return relativeLocation
-
+	return uintptr(memRead) - *base
 }
 
 func GetModulePatternStatic(pid uint32, hProcess *uintptr, moduleName string, aobScan string, size int) (uintptr, error) {
@@ -107,19 +92,21 @@ func GetModulePatternStatic(pid uint32, hProcess *uintptr, moduleName string, ao
 		size = 4
 	}
 	buf := make([]byte, 32)
-	if convertedAob, err = HexStringToPattern(aobScan); err != nil {
-		fmt.Printf("could not convert aobScan (%v) to converted AOB(%v)\n", aobScan, convertedAob)
+	pattern, err := HexStringToPattern(aobScan)
+	if err != nil {
+		fmt.Printf("could not convert aobScan (%v) to converted AOB(%v)\n", aobScan, err)
 		return 0, err
 	}
 
-	if addrLocation, err = ModulePatternScan(pid, hProcess, moduleName, convertedAob...); err != nil {
-		fmt.Printf("address location of module pattern scan invalid: %v; %v\n", err, convertedAob)
+	addrLocation, err := ModulePatternScan(pid, hProcess, moduleName, pattern...)
+	if err != nil {
+		fmt.Printf("address location of module pattern scan invalid: %v; %v\n", err, pattern)
 		return 0, err
 	}
 	if addrLocation == 0 {
 		return 0, fmt.Errorf("could not find pattern in module")
 	}
-	relativeLocation = uintptr(addrLocation)
+	relativeLocation := uintptr(addrLocation)
 
 	res := ReadRaw(hProcess, &relativeLocation, buf)
 	if !res {
@@ -135,36 +122,41 @@ func GetPointerStatic(pHandle, base *uintptr, aobScan *string, offset int64, pid
 	}
 	prebuf := make([]byte, 32)
 	buf := make([]byte, 32)
-	for i := 0; i < len(aobCache); i++ {
-		if aobCache[i].aobPattern == *aobScan {
-			if aobCache[i].address != 0 {
-				ReadRaw(pHandle, &aobCache[i].address, prebuf)
-				if aobCache[i].expected == ByteArrayToString(prebuf) {
-					return uintptr(aobCache[i].address)
-				}
-			}
+	aobMu.Lock()
+	cached := append([]AobCache(nil), aobCache...)
+	aobMu.Unlock()
+	for _, item := range cached {
+		if item.aobPattern != *aobScan || item.address == 0 {
+			continue
+		}
+		addr := item.address
+		ReadRaw(pHandle, &addr, prebuf)
+		if item.expected == ByteArrayToString(prebuf) {
+			return addr
 		}
 	}
-	if convertedAob, err = HexStringToPattern(*aobScan); err != nil {
-		fmt.Println("could not convert aobScan to converted AOB", aobScan, convertedAob)
+	pattern, err := HexStringToPattern(*aobScan)
+	if err != nil {
+		fmt.Println("could not convert aobScan to converted AOB", aobScan, err)
+		return 0
 	}
-	addrLocation = ProcessPatternScan(pHandle, 0, 0, convertedAob...) + offset
-
-	if memRead, err = ReadMemory(uintptr(addrLocation), int(*pid), size); err != nil {
+	found := ProcessPatternScan(pHandle, 0, 0, pattern...)
+	if found <= 0 {
+		fmt.Println("address location of pattern scan invalid")
+		return 0
+	}
+	memRead, err := ReadMemory(uintptr(found+offset), int(*pid), size)
+	if err != nil {
 		fmt.Println("address location of pattern scan invalid", err)
+		return 0
 	}
-	relativeLocation = uintptr(memRead) - *base
+	relativeLocation := uintptr(memRead) - *base
 
 	ReadRaw(pHandle, &relativeLocation, buf)
-	aobCache = append(aobCache,
-		AobCache{
-			*aobScan,
-			uintptr(relativeLocation),
-			ByteArrayToString(buf),
-		},
-	)
+	aobMu.Lock()
+	aobCache = append(aobCache, AobCache{*aobScan, relativeLocation, ByteArrayToString(buf)})
+	aobMu.Unlock()
 	return relativeLocation
-
 }
 func Int64ToHex(num int64) string {
 	hexString := strconv.FormatInt(num, 16)
@@ -301,21 +293,25 @@ func ReadMemoryStr(address uintptr, pid int) (string, error) {
 
 	var testStr strings.Builder
 	var output byte
-	for {
+	for i := 0; i < maxStringRead; i++ {
 		var bytesRead uintptr
-		_, _, err = readProcessMemory.Call(
+		r1, _, readErr := readProcessMemory.Call(
 			handle,
 			address,
 			uintptr(unsafe.Pointer(&output)),
 			1,
 			uintptr(unsafe.Pointer(&bytesRead)),
 		)
-		if bytesRead == 0 || output == 0 {
+		if r1 == 0 || bytesRead == 0 {
+			return "", fmt.Errorf("failed to read memory: %v", readErr)
+		}
+		if output == 0 {
 			return testStr.String(), nil
 		}
 		testStr.WriteByte(output)
 		address++
 	}
+	return "", fmt.Errorf("string longer than %d bytes", maxStringRead)
 }
 
 func WriteProcessMemory(pid uint32, address uintptr, valueToWrite float32, size uint32) error {
@@ -332,8 +328,8 @@ func WriteProcessMemory(pid uint32, address uintptr, valueToWrite float32, size 
 
 	// Write the value to the process memory
 	var bytesWritten uintptr
-	ret, _, err := writeProcessMemory.Call(processHandle, address, uintptr(unsafe.Pointer(&valueBytes[0])), uintptr(size), uintptr(unsafe.Pointer(&bytesWritten)))
-	if ret == 0 || err != nil {
+	ret, _, err := writeProcessMemory.Call(processHandle, address, uintptr(unsafe.Pointer(&valueBytes[0])), uintptr(len(valueBytes)), uintptr(unsafe.Pointer(&bytesWritten)))
+	if ret == 0 {
 		return fmt.Errorf("failed to write process memory: %v", err)
 	}
 
@@ -350,7 +346,8 @@ func GetAddress(PID int, Base uintptr, Address uintptr, Offset string) (uintptr,
 	if Offset == "" {
 		return PointerBase, nil
 	}
-	y, err := ReadMemory(PointerBase, PID, 4)
+	width := pointerSizeForPid(PID)
+	y, err := ReadMemory(PointerBase, PID, width)
 	if err != nil {
 		return 0, err
 	}
@@ -369,7 +366,7 @@ func GetAddress(PID int, Base uintptr, Address uintptr, Offset string) (uintptr,
 			return finalAddress, nil
 		} else {
 			newAddress := y + offset
-			y, err = ReadMemory(uintptr(newAddress), PID, 4)
+			y, err = ReadMemory(uintptr(newAddress), PID, width)
 			if err != nil {
 				return 0, err
 			}
@@ -395,11 +392,11 @@ func Float64ToFloat32(f64 float64) float32 {
 }
 
 func HexToFloat64(d uint64) float64 {
-	return Float32ToFloat64(HexToFloat(uint32(d)))
+	return math.Float64frombits(d)
 }
 
 func Float64ToHex(f float64) string {
-	return IntToHex(int(math.Float32bits(float32(f))))
+	return fmt.Sprintf("0x%X", math.Float64bits(f))
 }
 
 func Float64ToUint64(f float64) uint64 {
@@ -418,7 +415,7 @@ func IntToHexOld(value int) string {
 		n := (value >> (i * 4)) & 0xf
 
 		if n > 9 {
-			hexStr += string('A' + n - 10)
+			hexStr += string(rune('A' + n - 10))
 		} else {
 			hexStr += fmt.Sprintf("%X", n)
 		}
@@ -458,25 +455,30 @@ func ProcessPatternScan(hProcess *uintptr, startAddress uintptr, endAddress uint
 			return -1
 		}
 
-		if address == startAddress {
-			memInfo.RegionSize -= address - memInfo.BaseAddress
+		span, next, ok := regionSpan(address, memInfo)
+		if !ok {
+			next = address + 0x1000
+			if memInfo.BaseAddress > address {
+				next = memInfo.BaseAddress
+			}
+			if next <= address {
+				return 0
+			}
+			address = next
+			continue
 		}
 
 		if memInfo.State == MEM_COMMIT &&
 			(memInfo.Protect&(PAGE_NOACCESS|PAGE_GUARD) == 0) &&
-			memInfo.RegionSize >= uintptr(patternSize) {
+			span >= uintptr(patternSize) {
 
-			result := PatternScan(hProcess, &address, &memInfo.RegionSize, patternMask, &aobBuffer)
+			result := PatternScan(hProcess, &address, &span, patternMask, &aobBuffer)
 			if result > 0 {
 				return result
-			} else {
-				//fmt.Printf("Pattern not found in region: 0x%X - 0x%X\n", address, address+memInfo.RegionSize)
 			}
-		} else {
-			//fmt.Printf("Skipping memory region: 0x%X - 0x%X (state: %X, protect: %X)\n", memInfo.BaseAddress, memInfo.BaseAddress+memInfo.RegionSize, memInfo.State, memInfo.Protect)
 		}
 
-		address += memInfo.RegionSize
+		address = next
 	}
 
 	return 0
@@ -591,7 +593,10 @@ func BufferScanForMaskedPattern(haystack *[]byte, patternMask string, needle *[]
 var readProcessMemoryProc = kernel32a.MustFindProc("ReadProcessMemory")
 
 func ReadRaw(hProcess *uintptr, address *uintptr, buffer []byte, offsets ...uintptr) bool {
-	targetAddress := GetAddressFromOffsets(*address, offsets...)
+	targetAddress, addrErr := GetAddressFromOffsets(*hProcess, *address, offsets...)
+	if addrErr != nil {
+		return false
+	}
 
 	var numberOfBytesRead uint32
 
@@ -615,22 +620,31 @@ func ReadRaw(hProcess *uintptr, address *uintptr, buffer []byte, offsets ...uint
 	return true
 }
 
-func GetAddressFromOffsets(address uintptr, offsets ...uintptr) uintptr {
+func GetAddressFromOffsets(hProcess uintptr, address uintptr, offsets ...uintptr) (uintptr, error) {
 	if len(offsets) == 0 {
-		return address
+		return address, nil
 	}
-
-	lastOffset := offsets[len(offsets)-1]
-	offsets = offsets[:len(offsets)-1]
-	return lastOffset + Pointer(address, offsets...)
+	current := address
+	for i := 0; i < len(offsets)-1; i++ {
+		ptr, err := readPointer(hProcess, current)
+		if err != nil {
+			return 0, err
+		}
+		current = ptr + offsets[i]
+	}
+	return current + offsets[len(offsets)-1], nil
 }
 
-func Pointer(address uintptr, offsets ...uintptr) uintptr {
-	targetAddress := address
+func Pointer(hProcess uintptr, address uintptr, offsets ...uintptr) (uintptr, error) {
+	current := address
 	for _, offset := range offsets {
-		targetAddress = uintptr(unsafe.Pointer(uintptr(unsafe.Pointer(&targetAddress)) + offset))
+		ptr, err := readPointer(hProcess, current)
+		if err != nil {
+			return 0, err
+		}
+		current = ptr + offset
 	}
-	return targetAddress
+	return current, nil
 }
 func GetProcessHandle(pid uint32) uintptr {
 	kernel32 := syscall.MustLoadDLL("kernel32.dll")
@@ -717,12 +731,12 @@ func IsTarget64bit() (bool, error) {
 		return false, err
 	}
 
-	_, _, err = isWow64ProcessProc.Call(
+	r1, _, callErr := isWow64ProcessProc.Call(
 		uintptr(currentProcess),
 		uintptr(unsafe.Pointer(&isWow64)),
 	)
-	if err != nil {
-		return false, err
+	if r1 == 0 {
+		return false, callErr
 	}
 
 	return !isWow64, nil
@@ -761,73 +775,122 @@ func ModulePatternScan(pid uint32, hProcess *uintptr, moduleName string, aobPatt
 			return 0, fmt.Errorf("VirtualQueryEx failed for address: 0x%X", address)
 		}
 
+		span, next, ok := regionSpan(address, memInfo)
+		if !ok {
+			return 0, fmt.Errorf("pattern not found")
+		}
+
 		if memInfo.State == MEM_COMMIT &&
 			(memInfo.Protect&(PAGE_NOACCESS|PAGE_GUARD) == 0) &&
-			memInfo.RegionSize >= uintptr(patternSize) {
+			span >= uintptr(patternSize) {
 
-			result := PatternScan(hProcess, &address, &memInfo.RegionSize, patternMask, &needleBuffer)
+			result := PatternScan(hProcess, &address, &span, patternMask, &needleBuffer)
 
 			if result > 0 {
 				return result, nil
 			}
 		}
 
-		address += memInfo.RegionSize
+		address = next
 	}
 	return 0, fmt.Errorf("pattern not found")
 }
 
-func GetModuleInfo(processID uint32, moduleName string) (ModuleInfo, error) {
-	var moduleInfo ModuleInfo
+func pointerSize() int {
+	return int(unsafe.Sizeof(uintptr(0)))
+}
 
-	kernel32 := syscall.MustLoadDLL("kernel32.dll")
-	module32NextProc := kernel32.MustFindProc("Module32NextW")
-	module32FirstProc := kernel32.MustFindProc("Module32FirstW")
-	createToolhelp32SnapshotProc := kernel32.MustFindProc("CreateToolhelp32Snapshot")
-
-	snapshot, _, err := createToolhelp32SnapshotProc.Call(
-		TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,
-		uintptr(processID),
-	)
-	if snapshot == uintptr(syscall.InvalidHandle) {
-		return moduleInfo, fmt.Errorf("failed to create toolhelp32 snapshot: %v", err)
+func regionSpan(address uintptr, info MemoryInfo) (span uintptr, next uintptr, ok bool) {
+	if info.RegionSize == 0 {
+		return 0, 0, false
 	}
-	defer syscall.CloseHandle(syscall.Handle(snapshot))
+	end := info.BaseAddress + info.RegionSize
+	if end <= address {
+		return 0, 0, false
+	}
+	return end - address, end, true
+}
 
-	var me ModuleEntry32
-	me.dwSize = uint32(unsafe.Sizeof(me))
+func targetPointerSize(handle uintptr) int {
+	var wow64 int32
+	r1, _, _ := isWow64ProcessProc.Call(handle, uintptr(unsafe.Pointer(&wow64)))
+	if r1 != 0 && wow64 != 0 {
+		return 4
+	}
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		return 8
+	}
+	return 4
+}
 
-	ret, _, err := module32FirstProc.Call(snapshot, uintptr(unsafe.Pointer(&me)))
-	if ret == 0 {
-		return moduleInfo, fmt.Errorf("failed to get first module: %v", err)
+func pointerSizeForPid(pid int) int {
+	handle := GetProcessHandle(uint32(pid))
+	if handle == 0 {
+		return pointerSize()
+	}
+	defer closeHandle.Call(handle)
+	return targetPointerSize(handle)
+}
+
+func readPointer(hProcess uintptr, address uintptr) (uintptr, error) {
+	size := targetPointerSize(hProcess)
+	buf := make([]byte, size)
+	var n uintptr
+	r1, _, err := readProcessMemoryProc.Call(
+		hProcess,
+		address,
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(size),
+		uintptr(unsafe.Pointer(&n)),
+	)
+	if r1 == 0 || n != uintptr(size) {
+		return 0, fmt.Errorf("failed to read pointer at 0x%X: %v", address, err)
+	}
+	var value uint64
+	for i := 0; i < size; i++ {
+		value |= uint64(buf[i]) << (8 * i)
+	}
+	return uintptr(value), nil
+}
+
+func GetModuleInfo(processID uint32, moduleName string) (ModuleInfo, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPMODULE|windows.TH32CS_SNAPMODULE32, processID)
+	if err != nil {
+		return ModuleInfo{}, fmt.Errorf("failed to create toolhelp32 snapshot: %v", err)
+	}
+	defer windows.CloseHandle(snapshot)
+
+	var me windows.ModuleEntry32
+	me.Size = uint32(unsafe.Sizeof(me))
+	if err = windows.Module32First(snapshot, &me); err != nil {
+		return ModuleInfo{}, fmt.Errorf("failed to get first module: %v", err)
 	}
 
 	for {
-		currentModuleName := syscall.UTF16ToString(me.szModule[:])
-		//fmt.Printf("Checking module: %s\n", currentModuleName) // Debug log
-
+		currentModuleName := windows.UTF16ToString(me.Module[:])
 		if strings.EqualFold(currentModuleName, moduleName) {
-			moduleInfo.Name = currentModuleName
-			moduleInfo.FileName = syscall.UTF16ToString(me.szExePath[:])
-			moduleInfo.lpBaseOfDll = uintptr(me.modBaseAddr)
-			moduleInfo.SizeOfImage = int(me.modBaseSize)
-			moduleInfo.EntryPoint = uintptr(me.modBaseAddr)
-			//fmt.Printf("Found module: %+v\n", moduleInfo) // Debug log
-			return moduleInfo, nil
+			return ModuleInfo{
+				Name:        currentModuleName,
+				FileName:    windows.UTF16ToString(me.ExePath[:]),
+				lpBaseOfDll: me.ModBaseAddr,
+				SizeOfImage: int(me.ModBaseSize),
+				EntryPoint:  me.ModBaseAddr,
+			}, nil
 		}
-
-		ret, _, err = module32NextProc.Call(snapshot, uintptr(unsafe.Pointer(&me)))
-		if ret == 0 {
+		if err = windows.Module32Next(snapshot, &me); err != nil {
 			break
 		}
 	}
 
-	return moduleInfo, fmt.Errorf("module not found")
+	return ModuleInfo{}, fmt.Errorf("module not found")
 }
 
 func HexStringToByteArray(hexString string) []byte {
 	hexString = strings.ReplaceAll(hexString, " ", "")
 	hexString = strings.ReplaceAll(hexString, "0x", "")
+	if len(hexString) == 0 || len(hexString)%2 != 0 {
+		return nil
+	}
 
 	byteArray := make([]byte, len(hexString)/2)
 	for i := 0; i < len(hexString); i += 2 {
@@ -840,6 +903,9 @@ func HexStringToByteArray(hexString string) []byte {
 
 func WriteBytes(pid int, address uintptr, aobString string, offsets ...uintptr) error {
 	aob := HexStringToByteArray(aobString)
+	if len(aob) == 0 {
+		return fmt.Errorf("empty byte pattern")
+	}
 	if offsets == nil {
 		offsets = []uintptr{0x0}
 	}
@@ -854,11 +920,13 @@ func WriteBytes(pid int, address uintptr, aobString string, offsets ...uintptr) 
 	}
 	defer syscall.CloseHandle(syscall.Handle(hProcess))
 
-	targetAddress := GetAddressFromOffsets(address, offsets...)
-	//fmt.Printf("Target address: 0x%X\n", targetAddress)
+	targetAddress, err := GetAddressFromOffsets(hProcess, address, offsets...)
+	if err != nil {
+		return err
+	}
 
 	var numberOfBytesWritten uint32
-	res, _, err := writeProcessMemory.Call(
+	res, _, writeErr := writeProcessMemory.Call(
 		hProcess,
 		targetAddress,
 		uintptr(unsafe.Pointer(&aob[0])),
@@ -867,7 +935,7 @@ func WriteBytes(pid int, address uintptr, aobString string, offsets ...uintptr) 
 	)
 
 	if res == 0 {
-		return fmt.Errorf("failed to write memory: %v", err)
+		return fmt.Errorf("failed to write memory: %v", writeErr)
 	}
 
 	if numberOfBytesWritten != uint32(len(aob)) {
@@ -879,20 +947,19 @@ func WriteBytes(pid int, address uintptr, aobString string, offsets ...uintptr) 
 
 func WriteRaw(pid int, address uintptr, buffer []byte, sizeBytes int, offsets ...uintptr) error {
 	hProcess, _, err := openProcessProc.Call(
-		uintptr(PROCESS_VM_WRITE|PROCESS_VM_OPERATION),
+		uintptr(PROCESS_VM_WRITE|PROCESS_VM_OPERATION|PROCESS_VM_READ),
 		uintptr(0),
 		uintptr(uint32(pid)),
 	)
-	if err != nil {
+	if hProcess == 0 {
 		return fmt.Errorf("failed to open process: %v", err)
 	}
 	defer syscall.CloseHandle(syscall.Handle(hProcess))
 
-	if hProcess == 0 {
-		return fmt.Errorf("failed to open process")
+	targetAddress, err := GetAddressFromOffsets(hProcess, address, offsets...)
+	if err != nil {
+		return err
 	}
-
-	targetAddress := GetAddressFromOffsets(address, offsets...)
 
 	var numberOfBytesWritten uint32
 	res, _, err := writeProcessMemory.Call(
